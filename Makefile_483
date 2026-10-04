@@ -1,0 +1,17 @@
+CC = gcc
+CFLAGS = -Wall -Wextra -std=c11 -pthread
+
+.RECIPEPREFIX := >
+
+all: agent_483 controller_483
+
+agent_483: agent_483.c
+>$(CC) $(CFLAGS) agent_483.c -o agent_483
+
+controller_483: controller_483.c
+>$(CC) $(CFLAGS) controller_483.c -o controller_483
+
+clean:
+>rm -f agent_483 controller_483
+
+.PHONY: all clean
