@@ -19,6 +19,53 @@
 #define AUTH_COMMAND "AUTH OPS-2483"
 
 /* Send the complete response, even if send() sends only part. */
+
+/* Protect the shared log when several Controllers are connected. */
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_event(int fd, const char *event, const char *detail)
+{
+    char address[INET_ADDRSTRLEN] = "local";
+    unsigned int port = 0;
+    struct sockaddr_in peer;
+    socklen_t peer_size = sizeof(peer);
+
+    if (fd >= 0 &&
+        getpeername(fd, (struct sockaddr *)&peer, &peer_size) == 0) {
+        inet_ntop(AF_INET, &peer.sin_addr, address, sizeof(address));
+        port = ntohs(peer.sin_port);
+    }
+
+    char clean[8192];
+    size_t used = 0;
+    while (detail[used] && used < sizeof(clean) - 1) {
+        unsigned char ch = (unsigned char)detail[used];
+        clean[used] = (ch < 32 || ch == 127) ? ' ' : (char)ch;
+        used++;
+    }
+    clean[used] = '\0';
+
+    time_t now = time(NULL);
+    struct tm local;
+    char timestamp[32] = "unknown-time";
+    if (localtime_r(&now, &local))
+        strftime(timestamp, sizeof(timestamp),
+                 "%Y-%m-%d %H:%M:%S", &local);
+
+    pthread_mutex_lock(&log_mutex);
+    FILE *file = fopen("remoteops_IT24102483.log", "a");
+    if (file) {
+        fprintf(file,
+                "[%s] IT24102483 peer=%s:%u fd=%d %s %s\n",
+                timestamp, address, port, fd, event, clean);
+        if (fclose(file) != 0)
+            perror("Log close");
+    } else {
+        perror("Log open");
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
 static int send_response(int fd, const char *text)
 {
     size_t sent = 0;
@@ -32,6 +79,7 @@ static int send_response(int fd, const char *text)
             return -1;
         sent += (size_t)n;
     }
+    log_event(fd, "RESPONSE", text);
     return 0;
 }
 
@@ -536,6 +584,7 @@ static void *handle_client(void *argument)
     atomic_init(&monitor.stop, 0);
 
         printf("Controller connected.\n");
+        log_event(client_fd, "CONNECT", "TCP session opened");
         int authenticated = 0;
         char command[BUFFER_SIZE];
 
@@ -551,16 +600,23 @@ static void *handle_client(void *argument)
             }
 
             printf("Received: %s\n", command);
+            if (strncmp(command, "AUTH", 4) == 0)
+                log_event(client_fd, "COMMAND", "AUTH [token omitted]");
+            else
+                log_event(client_fd, "COMMAND", command);
+
 
             if (!authenticated) {
                 if (strcmp(command, AUTH_COMMAND) == 0) {
                     authenticated = 1;
+                    log_event(client_fd, "AUTH", "SUCCESS");
                     if (send_response(client_fd,
                                       "OK AUTH SID:3842\n") < 0)
                         break;
                 } else {
                     send_response(client_fd,
                                   "ERR 001 UNAUTHORIZED SID:3842\n");
+                    log_event(client_fd, "AUTH", "FAILED");
                     break;
                 }
                 continue;
@@ -619,6 +675,7 @@ static void *handle_client(void *argument)
         }
 
         stop_monitor(&monitor);
+        log_event(client_fd, "DISCONNECT", "TCP session ended");
         close(client_fd);
         printf("Controller disconnected.\n");
 
@@ -662,6 +719,7 @@ int main(void)
 
     printf("RemoteOps Agent - IT24102483\n");
     printf("Listening on TCP port %d...\n", PORT);
+    log_event(-1, "START", "Agent listening on TCP port 9410");
 
     while (1) {
         int client_fd = accept(server_fd, NULL, NULL);
