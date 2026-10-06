@@ -4,6 +4,8 @@
 #include <fcntl.h>
 
 #include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,7 +64,7 @@ static int read_command(int fd, char *buffer, size_t capacity)
 
 
 /* Read Linux system statistics and send a personalised response. */
-static int handle_sysinfo(int fd)
+static int build_sysinfo(char *response, size_t capacity)
 {
     double cpu_load = 0.0;
     double uptime = 0.0;
@@ -71,32 +73,26 @@ static int handle_sysinfo(int fd)
     int found_total = 0;
     int found_available = 0;
     char line[256];
-    char response[256];
 
     FILE *file = fopen("/proc/loadavg", "r");
     if (!file)
-        return send_response(fd,
-                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+        return -1;
     int valid = fscanf(file, "%lf", &cpu_load) == 1;
     fclose(file);
     if (!valid)
-        return send_response(fd,
-                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+        return -1;
 
     file = fopen("/proc/uptime", "r");
     if (!file)
-        return send_response(fd,
-                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+        return -1;
     valid = fscanf(file, "%lf", &uptime) == 1;
     fclose(file);
     if (!valid)
-        return send_response(fd,
-                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+        return -1;
 
     file = fopen("/proc/meminfo", "r");
     if (!file)
-        return send_response(fd,
-                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+        return -1;
 
     while (fgets(line, sizeof(line), file)) {
         if (sscanf(line, "MemTotal: %lu kB", &total_kb) == 1)
@@ -109,18 +105,26 @@ static int handle_sysinfo(int fd)
 
     if (!found_total || !found_available ||
         available_kb > total_kb)
-        return send_response(fd,
-                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+        return -1;
 
     double used_mb = (total_kb - available_kb) / 1024.0;
 
-    snprintf(response, sizeof(response),
+    snprintf(response, capacity,
              "OK SYSINFO %.2f %.2f %.0f SID:3842\n",
              cpu_load, used_mb, uptime);
 
-    return send_response(fd, response);
+    return 0;
 }
 
+
+
+static int handle_sysinfo(int fd)
+{
+    char response[256];
+    if (build_sysinfo(response, sizeof(response)) < 0)
+        return send_response(fd, "ERR 006 SYSINFO_FAILED SID:3842\n");
+    return send_response(fd, response);
+}
 
 /* Return process names and PIDs as one comma-separated line. */
 static int handle_listproc(int fd)
@@ -424,10 +428,112 @@ static int handle_get(int fd, const char *command)
     return result;
 }
 
+
+/* Monitoring belongs to one authenticated TCP session. */
+struct monitor_state {
+    int udp_fd;
+    int running;
+    pthread_t thread;
+    atomic_int stop;
+    struct sockaddr_in destination;
+};
+
+static void *monitor_worker(void *argument)
+{
+    struct monitor_state *state = argument;
+
+    while (!atomic_load(&state->stop)) {
+        char response[256];
+
+        if (build_sysinfo(response, sizeof(response)) == 0) {
+            /* UDP format starts with SYSINFO, without TCP's OK. */
+            const char *message = response + 3;
+            sendto(state->udp_fd, message, strlen(message), 0,
+                   (struct sockaddr *)&state->destination,
+                   sizeof(state->destination));
+        }
+
+        /* Send every two seconds; check STOP every 100 ms. */
+        for (int i = 0; i < 20; i++) {
+            if (atomic_load(&state->stop))
+                break;
+            struct timespec delay = {0, 100000000L};
+            while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {
+                if (atomic_load(&state->stop))
+                    break;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void stop_monitor(struct monitor_state *state)
+{
+    if (!state->running)
+        return;
+
+    atomic_store(&state->stop, 1);
+    pthread_join(state->thread, NULL);
+    close(state->udp_fd);
+    state->udp_fd = -1;
+    state->running = 0;
+}
+
+static int handle_monitor(int fd, const char *command,
+                          struct monitor_state *state)
+{
+    if (strcmp(command, "MONITOR STOP") == 0) {
+        stop_monitor(state);
+        return send_response(fd, "OK MONITOR_STOPPED SID:3842\n");
+    }
+
+    char port_text[16], extra;
+    if (sscanf(command, "MONITOR START %15s %c",
+               port_text, &extra) != 1 ||
+        strspn(port_text, "0123456789") != strlen(port_text))
+        return send_response(fd, "ERR 003 INVALID_MONITOR SID:3842\n");
+
+    errno = 0;
+    char *end;
+    unsigned long port = strtoul(port_text, &end, 10);
+    if (errno || *end || port == 0 || port > 65535)
+        return send_response(fd, "ERR 003 INVALID_MONITOR SID:3842\n");
+
+    struct sockaddr_in peer;
+    socklen_t peer_size = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &peer_size) < 0)
+        return send_response(fd, "ERR 006 MONITOR_FAILED SID:3842\n");
+
+    stop_monitor(state);
+
+    state->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (state->udp_fd < 0)
+        return send_response(fd, "ERR 006 MONITOR_FAILED SID:3842\n");
+
+    state->destination = peer;
+    state->destination.sin_port = htons((unsigned short)port);
+    atomic_store(&state->stop, 0);
+
+    int error = pthread_create(&state->thread, NULL,
+                               monitor_worker, state);
+    if (error != 0) {
+        close(state->udp_fd);
+        state->udp_fd = -1;
+        return send_response(fd, "ERR 006 MONITOR_FAILED SID:3842\n");
+    }
+
+    state->running = 1;
+    return send_response(fd, "OK MONITOR_STARTED SID:3842\n");
+}
+
 static void *handle_client(void *argument)
 {
     int client_fd = *(int *)argument;
     free(argument);
+
+    struct monitor_state monitor = {0};
+    monitor.udp_fd = -1;
+    atomic_init(&monitor.stop, 0);
 
         printf("Controller connected.\n");
         int authenticated = 0;
@@ -493,7 +599,16 @@ static void *handle_client(void *argument)
                 continue;
             }
 
+
+            if (strcmp(command, "MONITOR") == 0 ||
+                strncmp(command, "MONITOR ", 8) == 0) {
+                if (handle_monitor(client_fd, command, &monitor) < 0)
+                    break;
+                continue;
+            }
+
             if (strcmp(command, "QUIT") == 0) {
+                stop_monitor(&monitor);
                 send_response(client_fd, "OK BYE SID:3842\n");
                 break;
             }
@@ -503,6 +618,7 @@ static void *handle_client(void *argument)
                 break;
         }
 
+        stop_monitor(&monitor);
         close(client_fd);
         printf("Controller disconnected.\n");
 
