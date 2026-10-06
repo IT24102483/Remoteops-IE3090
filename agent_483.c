@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -115,6 +116,74 @@ static int handle_sysinfo(int fd)
     return send_response(fd, response);
 }
 
+
+/* Return process names and PIDs as one comma-separated line. */
+static int handle_listproc(int fd)
+{
+    DIR *directory = opendir("/proc");
+    if (!directory)
+        return send_response(fd,
+                             "ERR 006 LISTPROC_FAILED SID:3842\n");
+
+    char response[8000] = "OK PROCS ";
+    size_t used = strlen(response);
+    const char *suffix = " SID:3842\n";
+    struct dirent *entry;
+    int count = 0;
+
+    while ((entry = readdir(directory)) != NULL) {
+        const char *pid = entry->d_name;
+        if (!pid[0] || strspn(pid, "0123456789") != strlen(pid))
+            continue;
+
+        char filename[512];
+        snprintf(filename, sizeof(filename), "/proc/%s/comm", pid);
+
+        FILE *file = fopen(filename, "r");
+        if (!file)
+            continue;
+
+        char name[256];
+        if (!fgets(name, sizeof(name), file)) {
+            fclose(file);
+            continue;
+        }
+        fclose(file);
+
+        name[strcspn(name, "\r\n")] = '\0';
+        for (size_t i = 0; name[i]; i++) {
+            unsigned char ch = (unsigned char)name[i];
+            if (ch <= 32 || ch == ',' || ch == '(' || ch == ')')
+                name[i] = '_';
+        }
+
+        char item[600];
+        int length = snprintf(item, sizeof(item), "%s%s(%s)",
+                              count ? "," : "", name, pid);
+        if (length < 0 || (size_t)length >= sizeof(item))
+            continue;
+
+        if (used + (size_t)length + strlen(suffix) + 1 >
+            sizeof(response))
+            break;
+
+        memcpy(response + used, item, (size_t)length);
+        used += (size_t)length;
+        response[used] = '\0';
+        count++;
+    }
+
+    closedir(directory);
+
+    if (!count) {
+        strcpy(response + used, "NONE");
+        used += strlen("NONE");
+    }
+
+    strcpy(response + used, suffix);
+    return send_response(fd, response);
+}
+
 int main(void)
 {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -194,6 +263,12 @@ int main(void)
 
             if (strcmp(command, "SYSINFO") == 0) {
                 if (handle_sysinfo(client_fd) < 0)
+                    break;
+                continue;
+            }
+
+            if (strcmp(command, "LISTPROC") == 0) {
+                if (handle_listproc(client_fd) < 0)
                     break;
                 continue;
             }
