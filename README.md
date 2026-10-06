@@ -108,10 +108,3 @@ with the report.
   token and does not encrypt network traffic.
 - Unexpected TCP disconnect is detected when socket I/O reports
   closure or an error; network outages can take longer to detect.
-
-## AI assistance
-
-AI assistance was used for explanations, code generation,
-incremental patches and validation commands. Details are recorded
-in prompt_log.md. Test evidence comes from actual execution on
-the CentOS environment.
