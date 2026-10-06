@@ -4,6 +4,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -185,6 +188,163 @@ static int download_file(int fd, const char *name)
     return 0;
 }
 
+
+struct udp_receiver {
+    int fd;
+    int running;
+    pthread_t thread;
+    atomic_int stop;
+    struct in_addr agent_ip;
+};
+
+static void *receive_udp(void *argument)
+{
+    struct udp_receiver *receiver = argument;
+    struct pollfd event = {receiver->fd, POLLIN, 0};
+
+    while (!atomic_load(&receiver->stop)) {
+        int ready = poll(&event, 1, 100);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (!ready)
+            continue;
+        if (!(event.revents & POLLIN))
+            break;
+
+        char message[2048];
+        struct sockaddr_in source;
+        socklen_t source_size = sizeof(source);
+        ssize_t n = recvfrom(receiver->fd, message,
+                             sizeof(message) - 1, MSG_DONTWAIT,
+                             (struct sockaddr *)&source, &source_size);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN ||
+                errno == EWOULDBLOCK)
+                continue;
+            break;
+        }
+
+        message[n] = '\0';
+        if (source.sin_addr.s_addr != receiver->agent_ip.s_addr ||
+            n < 10 || memchr(message, '\0', (size_t)n) != NULL)
+            continue;
+
+        double load, memory, uptime;
+        char sid[32], extra;
+        if (sscanf(message, "SYSINFO %lf %lf %lf %31s %c",
+                   &load, &memory, &uptime, sid, &extra) != 4 ||
+            strncmp(message, "SYSINFO ", 8) != 0 ||
+            strcmp(sid, "SID:3842") != 0 ||
+            strcmp(message + n - 10, " SID:3842\n") != 0)
+            continue;
+
+        printf("\nUDP: %sremoteops> ", message);
+        fflush(stdout);
+    }
+    return NULL;
+}
+
+static void stop_receiver(struct udp_receiver *receiver)
+{
+    if (!receiver->running)
+        return;
+    atomic_store(&receiver->stop, 1);
+    pthread_join(receiver->thread, NULL);
+    close(receiver->fd);
+    receiver->fd = -1;
+    receiver->running = 0;
+}
+
+static int monitor_command(int sock, const char *command,
+                           struct udp_receiver *receiver)
+{
+    char response[8192];
+    int starting = strcmp(command, "MONITOR STOP") != 0;
+
+    if (starting) {
+        char port_text[16], extra;
+        if (sscanf(command, "MONITOR START %15s %c",
+                   port_text, &extra) != 1 ||
+            strspn(port_text, "0123456789") != strlen(port_text)) {
+            puts("Use MONITOR START port or MONITOR STOP.");
+            return 0;
+        }
+
+        errno = 0;
+        char *end;
+        unsigned long port = strtoul(port_text, &end, 10);
+        if (errno || *end || port == 0 || port > 65535) {
+            puts("UDP port must be between 1 and 65535.");
+            return 0;
+        }
+
+        if (receiver->running) {
+            puts("Use MONITOR STOP before starting again.");
+            return 0;
+        }
+
+        receiver->fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (receiver->fd < 0) {
+            perror("UDP socket");
+            return 0;
+        }
+
+        struct sockaddr_in local = {0};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = htonl(INADDR_ANY);
+        local.sin_port = htons((unsigned short)port);
+
+        if (bind(receiver->fd, (struct sockaddr *)&local,
+                 sizeof(local)) < 0) {
+            perror("UDP bind");
+            close(receiver->fd);
+            receiver->fd = -1;
+            return 0;
+        }
+    }
+
+    char request[1024];
+    snprintf(request, sizeof(request), "%s\n", command);
+    if (send_all(sock, request, strlen(request)) < 0 ||
+        read_line(sock, response, sizeof(response)) < 0) {
+        if (starting) {
+            close(receiver->fd);
+            receiver->fd = -1;
+        }
+        return -1;
+    }
+
+    printf("Agent: %s", response);
+
+    if (!starting) {
+        if (strcmp(response, "OK MONITOR_STOPPED SID:3842\n") == 0)
+            stop_receiver(receiver);
+        return 0;
+    }
+
+    if (strcmp(response, "OK MONITOR_STARTED SID:3842\n") != 0) {
+        close(receiver->fd);
+        receiver->fd = -1;
+        return 0;
+    }
+
+    atomic_store(&receiver->stop, 0);
+    int error = pthread_create(&receiver->thread, NULL,
+                               receive_udp, receiver);
+    if (error != 0) {
+        fprintf(stderr, "UDP thread: %s\n", strerror(error));
+        close(receiver->fd);
+        receiver->fd = -1;
+        return -1;
+    }
+
+    receiver->running = 1;
+    return 0;
+}
+
 int main(void)
 {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -207,6 +367,12 @@ int main(void)
     printf("Connected to Agent on port %d\n", PORT);
     puts("File commands: PUT filename / GET filename");
 
+
+    struct udp_receiver receiver = {0};
+    receiver.fd = -1;
+    receiver.agent_ip = server.sin_addr;
+    atomic_init(&receiver.stop, 0);
+
     char command[1024], response[8192];
     while (1) {
         printf("remoteops> ");
@@ -224,6 +390,16 @@ int main(void)
             command[--length] = '\0';
         if (!length)
             continue;
+
+
+        if (strcmp(command, "MONITOR") == 0 ||
+            strncmp(command, "MONITOR ", 8) == 0) {
+            if (monitor_command(sock, command, &receiver) < 0) {
+                puts("Monitoring communication failed.");
+                break;
+            }
+            continue;
+        }
 
         int is_put = strcmp(command, "PUT") == 0 ||
                      strncmp(command, "PUT ", 4) == 0;
@@ -259,6 +435,7 @@ int main(void)
             break;
     }
 
+    stop_receiver(&receiver);
     close(sock);
     return 0;
 }
