@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <dirent.h>
 #include <stdlib.h>
@@ -184,6 +185,63 @@ static int handle_listproc(int fd)
     return send_response(fd, response);
 }
 
+
+/* Only fixed commands from this whitelist may be executed. */
+static int handle_exec(int fd, const char *command)
+{
+    const char *program = NULL;
+
+    if (strcmp(command, "EXEC DATE") == 0)
+        program = "/usr/bin/date";
+    else if (strcmp(command, "EXEC UPTIME") == 0)
+        program = "/usr/bin/uptime";
+    else if (strcmp(command, "EXEC DISKFREE") == 0)
+        program = "/usr/bin/df -h /";
+    else if (strcmp(command, "EXEC HOSTNAME") == 0)
+        program = "/usr/bin/hostname";
+    else if (strcmp(command, "EXEC WHOAMI") == 0)
+        program = "/usr/bin/whoami";
+    else
+        return send_response(fd,
+                             "ERR 002 COMMAND_NOT_ALLOWED SID:3842\n");
+
+    FILE *pipe = popen(program, "r");
+    if (!pipe)
+        return send_response(fd,
+                             "ERR 006 EXEC_FAILED SID:3842\n");
+
+    char response[4096] = "OK EXEC_RESULT ";
+    size_t used = strlen(response);
+    const char *suffix = " SID:3842\n";
+    int ch;
+    int overflow = 0;
+
+    while ((ch = fgetc(pipe)) != EOF) {
+        if (used + strlen(suffix) + 1 >= sizeof(response)) {
+            overflow = 1;
+            continue;
+        }
+
+        if (ch < 32 || ch == 127)
+            ch = ' ';
+        response[used++] = (char)ch;
+    }
+
+    int read_failed = ferror(pipe);
+    int status = pclose(pipe);
+
+    if (read_failed || status != 0 || overflow)
+        return send_response(fd,
+                             "ERR 006 EXEC_FAILED SID:3842\n");
+
+    while (used > strlen("OK EXEC_RESULT ") &&
+           response[used - 1] == ' ')
+        used--;
+
+    strcpy(response + used, suffix);
+    return send_response(fd, response);
+}
+
 int main(void)
 {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -269,6 +327,13 @@ int main(void)
 
             if (strcmp(command, "LISTPROC") == 0) {
                 if (handle_listproc(client_fd) < 0)
+                    break;
+                continue;
+            }
+
+            if (strcmp(command, "EXEC") == 0 ||
+                strncmp(command, "EXEC ", 5) == 0) {
+                if (handle_exec(client_fd, command) < 0)
                     break;
                 continue;
             }
