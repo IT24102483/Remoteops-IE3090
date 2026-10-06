@@ -54,6 +54,67 @@ static int read_command(int fd, char *buffer, size_t capacity)
     return -1;
 }
 
+
+/* Read Linux system statistics and send a personalised response. */
+static int handle_sysinfo(int fd)
+{
+    double cpu_load = 0.0;
+    double uptime = 0.0;
+    unsigned long total_kb = 0;
+    unsigned long available_kb = 0;
+    int found_total = 0;
+    int found_available = 0;
+    char line[256];
+    char response[256];
+
+    FILE *file = fopen("/proc/loadavg", "r");
+    if (!file)
+        return send_response(fd,
+                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+    int valid = fscanf(file, "%lf", &cpu_load) == 1;
+    fclose(file);
+    if (!valid)
+        return send_response(fd,
+                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+
+    file = fopen("/proc/uptime", "r");
+    if (!file)
+        return send_response(fd,
+                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+    valid = fscanf(file, "%lf", &uptime) == 1;
+    fclose(file);
+    if (!valid)
+        return send_response(fd,
+                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+
+    file = fopen("/proc/meminfo", "r");
+    if (!file)
+        return send_response(fd,
+                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+
+    while (fgets(line, sizeof(line), file)) {
+        if (sscanf(line, "MemTotal: %lu kB", &total_kb) == 1)
+            found_total = 1;
+        if (sscanf(line, "MemAvailable: %lu kB",
+                   &available_kb) == 1)
+            found_available = 1;
+    }
+    fclose(file);
+
+    if (!found_total || !found_available ||
+        available_kb > total_kb)
+        return send_response(fd,
+                             "ERR 006 SYSINFO_FAILED SID:3842\n");
+
+    double used_mb = (total_kb - available_kb) / 1024.0;
+
+    snprintf(response, sizeof(response),
+             "OK SYSINFO %.2f %.2f %.0f SID:3842\n",
+             cpu_load, used_mb, uptime);
+
+    return send_response(fd, response);
+}
+
 int main(void)
 {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -128,6 +189,12 @@ int main(void)
                                   "ERR 001 UNAUTHORIZED SID:3842\n");
                     break;
                 }
+                continue;
+            }
+
+            if (strcmp(command, "SYSINFO") == 0) {
+                if (handle_sysinfo(client_fd) < 0)
+                    break;
                 continue;
             }
 
