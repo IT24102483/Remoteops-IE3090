@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
+#include <pthread.h>
 #include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
@@ -242,51 +243,12 @@ static int handle_exec(int fd, const char *command)
     return send_response(fd, response);
 }
 
-int main(void)
+
+/* Each Controller has its own socket and authentication state. */
+static void *handle_client(void *argument)
 {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket");
-        return EXIT_FAILURE;
-    }
-
-    int reuse = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
-                   &reuse, sizeof(reuse)) < 0) {
-        perror("setsockopt");
-        close(server_fd);
-        return EXIT_FAILURE;
-    }
-
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_addr.sin_port = htons(PORT);
-
-    if (bind(server_fd, (struct sockaddr *)&server_addr,
-             sizeof(server_addr)) < 0) {
-        perror("bind");
-        close(server_fd);
-        return EXIT_FAILURE;
-    }
-
-    if (listen(server_fd, 5) < 0) {
-        perror("listen");
-        close(server_fd);
-        return EXIT_FAILURE;
-    }
-
-    printf("RemoteOps Agent - IT24102483\n");
-    printf("Listening on TCP port %d...\n", PORT);
-
-    while (1) {
-        int client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (errno != EINTR)
-                perror("accept");
-            continue;
-        }
+    int client_fd = *(int *)argument;
+    free(argument);
 
         printf("Controller connected.\n");
         int authenticated = 0;
@@ -350,6 +312,75 @@ int main(void)
 
         close(client_fd);
         printf("Controller disconnected.\n");
+
+    return NULL;
+}
+
+int main(void)
+{
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
+        return EXIT_FAILURE;
+    }
+
+    int reuse = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+                   &reuse, sizeof(reuse)) < 0) {
+        perror("setsockopt");
+        close(server_fd);
+        return EXIT_FAILURE;
+    }
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&server_addr,
+             sizeof(server_addr)) < 0) {
+        perror("bind");
+        close(server_fd);
+        return EXIT_FAILURE;
+    }
+
+    if (listen(server_fd, 5) < 0) {
+        perror("listen");
+        close(server_fd);
+        return EXIT_FAILURE;
+    }
+
+    printf("RemoteOps Agent - IT24102483\n");
+    printf("Listening on TCP port %d...\n", PORT);
+
+    while (1) {
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno != EINTR)
+                perror("accept");
+            continue;
+        }
+
+        int *client_socket = malloc(sizeof(*client_socket));
+        if (!client_socket) {
+            perror("malloc");
+            close(client_fd);
+            continue;
+        }
+
+        *client_socket = client_fd;
+        pthread_t thread;
+        int error = pthread_create(&thread, NULL,
+                                   handle_client, client_socket);
+        if (error != 0) {
+            fprintf(stderr, "pthread_create: %s\n", strerror(error));
+            free(client_socket);
+            close(client_fd);
+            continue;
+        }
+
+        pthread_detach(thread);
     }
 
     close(server_fd);
