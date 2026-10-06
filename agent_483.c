@@ -1,5 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 #include <pthread.h>
 #include <dirent.h>
 #include <stdlib.h>
@@ -245,6 +248,182 @@ static int handle_exec(int fd, const char *command)
 
 
 /* Each Controller has its own socket and authentication state. */
+
+#define FILE_LIMIT (10ULL * 1024 * 1024)
+#define FILE_DIRECTORY "./agentfiles/IT24102483"
+
+static int send_bytes(int fd, const void *data, size_t size)
+{
+    size_t done = 0;
+    while (done < size) {
+        ssize_t n = send(fd, (const char *)data + done,
+                         size - done, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        done += (size_t)n;
+    }
+    return 0;
+}
+
+/* Only a plain filename is allowed, without directory paths. */
+static int valid_filename(const char *name)
+{
+    size_t length = strlen(name);
+    if (!length || length > 200 || name[0] == '.')
+        return 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char ch = (unsigned char)name[i];
+        if (!((ch >= 'a' && ch <= 'z') ||
+              (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9') ||
+              ch == '.' || ch == '_' || ch == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+static int handle_put(int fd, const char *command)
+{
+    char name[201], size_text[32], extra;
+    if (sscanf(command, "PUT %200s %31s %c",
+               name, size_text, &extra) != 2 ||
+        !valid_filename(name) ||
+        strspn(size_text, "0123456789") != strlen(size_text)) {
+        send_response(fd, "ERR 003 INVALID_PUT SID:3842\n");
+        return -1;
+    }
+
+    errno = 0;
+    char *end;
+    unsigned long long size = strtoull(size_text, &end, 10);
+    if (errno || *end || size > FILE_LIMIT) {
+        send_response(fd, "ERR 004 FILE_TOO_LARGE SID:3842\n");
+        return -1;
+    }
+
+    char target[512];
+    char temporary[512];
+    snprintf(target, sizeof(target), "%s/%s", FILE_DIRECTORY, name);
+    snprintf(temporary, sizeof(temporary),
+             "%s/.upload-XXXXXX", FILE_DIRECTORY);
+
+    int output = mkstemp(temporary);
+    if (output < 0) {
+        send_response(fd, "ERR 006 FILE_WRITE_FAILED SID:3842\n");
+        return -1;
+    }
+
+    unsigned long long remaining = size;
+    char buffer[4096];
+    int failed = 0;
+
+    while (remaining > 0) {
+        size_t chunk = remaining > sizeof(buffer) ?
+                       sizeof(buffer) : (size_t)remaining;
+        ssize_t received = recv(fd, buffer, chunk, 0);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received <= 0) {
+            failed = 1;
+            break;
+        }
+
+        size_t written = 0;
+        while (written < (size_t)received) {
+            ssize_t n = write(output, buffer + written,
+                              (size_t)received - written);
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0) {
+                failed = 1;
+                break;
+            }
+            written += (size_t)n;
+        }
+        if (failed)
+            break;
+        remaining -= (unsigned long long)received;
+    }
+
+    if (close(output) < 0)
+        failed = 1;
+
+    if (failed) {
+        unlink(temporary);
+        send_response(fd, "ERR 006 FILE_TRANSFER_FAILED SID:3842\n");
+        return -1;
+    }
+
+    if (rename(temporary, target) < 0) {
+        unlink(temporary);
+        return send_response(fd,
+                             "ERR 006 FILE_WRITE_FAILED SID:3842\n");
+    }
+
+    char response[512];
+    snprintf(response, sizeof(response),
+             "OK FILE_RECEIVED %s SID:3842\n", name);
+    return send_response(fd, response);
+}
+
+static int handle_get(int fd, const char *command)
+{
+    char name[201], extra;
+    if (sscanf(command, "GET %200s %c", name, &extra) != 1 ||
+        !valid_filename(name))
+        return send_response(fd, "ERR 003 INVALID_GET SID:3842\n");
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", FILE_DIRECTORY, name);
+    int input = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (input < 0)
+        return send_response(fd, "ERR 005 FILE_NOT_FOUND SID:3842\n");
+
+    struct stat info;
+    if (fstat(input, &info) < 0 || !S_ISREG(info.st_mode) ||
+        info.st_size < 0) {
+        close(input);
+        return send_response(fd, "ERR 005 FILE_NOT_FOUND SID:3842\n");
+    }
+
+    if ((unsigned long long)info.st_size > FILE_LIMIT) {
+        close(input);
+        return send_response(fd, "ERR 004 FILE_TOO_LARGE SID:3842\n");
+    }
+
+    char response[512];
+    snprintf(response, sizeof(response),
+             "OK FILE_SEND %s %llu SID:3842\n",
+             name, (unsigned long long)info.st_size);
+
+    if (send_response(fd, response) < 0) {
+        close(input);
+        return -1;
+    }
+
+    unsigned long long remaining = (unsigned long long)info.st_size;
+    char buffer[4096];
+    int result = 0;
+
+    while (remaining > 0) {
+        size_t chunk = remaining > sizeof(buffer) ?
+                       sizeof(buffer) : (size_t)remaining;
+        ssize_t n = read(input, buffer, chunk);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0 || send_bytes(fd, buffer, (size_t)n) < 0) {
+            result = -1;
+            break;
+        }
+        remaining -= (unsigned long long)n;
+    }
+
+    close(input);
+    return result;
+}
+
 static void *handle_client(void *argument)
 {
     int client_fd = *(int *)argument;
@@ -296,6 +475,20 @@ static void *handle_client(void *argument)
             if (strcmp(command, "EXEC") == 0 ||
                 strncmp(command, "EXEC ", 5) == 0) {
                 if (handle_exec(client_fd, command) < 0)
+                    break;
+                continue;
+            }
+
+            if (strcmp(command, "PUT") == 0 ||
+                strncmp(command, "PUT ", 4) == 0) {
+                if (handle_put(client_fd, command) < 0)
+                    break;
+                continue;
+            }
+
+            if (strcmp(command, "GET") == 0 ||
+                strncmp(command, "GET ", 4) == 0) {
+                if (handle_get(client_fd, command) < 0)
                     break;
                 continue;
             }
