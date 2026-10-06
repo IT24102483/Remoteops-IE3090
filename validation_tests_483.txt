@@ -1,0 +1,37 @@
+RemoteOps Validation — IT24102483
+Execution date: 2026-10-06
+Environment: CentOS Stream 10
+Agent TCP address used: 127.0.0.1:9410
+
+Confirmed test results:
+
+PASS — Valid AUTH OPS-2483 accepted.
+PASS — Incorrect authentication rejected with ERR 001.
+PASS — SYSINFO returns a personalised response.
+PASS — EXEC DATE returns command output.
+PASS — Missing file rejected with ERR 005.
+PASS — Text upload/download integrity verified using cmp.
+PASS — Five authenticated TCP sessions remain open together
+       and each receives a SYSINFO response.
+PASS — Commands sent in separate pieces are processed correctly.
+PASS — Multiple commands sent together are processed correctly.
+PASS — 65536-byte random binary upload/download matches exactly.
+PASS — Empty file upload/download matches exactly.
+PASS — PUT header, raw bytes and following SYSINFO command
+       sent together are processed correctly.
+PASS — Directory traversal GET filename rejected.
+PASS — EXEC LS rejected as outside the whitelist.
+PASS — Upload larger than 10 MiB rejected.
+PASS — UDP monitoring message received.
+PASS — UDP monitoring stopped after TCP disconnect.
+
+Evidence:
+Text file integrity screenshot.
+18_five_clients_tcp.png
+19_files_udp_cleanup.png
+
+Other evidence to include after checking the actual output:
+LISTPROC response.
+All five allowed EXEC commands.
+Controller UDP display and MONITOR STOP.
+Timestamped Agent log.
