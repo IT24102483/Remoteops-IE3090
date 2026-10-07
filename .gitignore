@@ -1,3 +1,5 @@
 agent_483
 controller_483
 *.o
+
+/prompt_log.md
