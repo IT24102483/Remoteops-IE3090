@@ -611,11 +611,11 @@ static void *handle_client(void *argument)
                     authenticated = 1;
                     log_event(client_fd, "AUTH", "SUCCESS");
                     if (send_response(client_fd,
-                                      "OK AUTH SID:3842\n") < 0)
+                                      "OK AUTHENTICATED SID:3842\n") < 0)
                         break;
                 } else {
                     send_response(client_fd,
-                                  "ERR 001 UNAUTHORIZED SID:3842\n");
+                                  "ERR 001 AUTH_FAILED SID:3842\n");
                     log_event(client_fd, "AUTH", "FAILED");
                     break;
                 }
